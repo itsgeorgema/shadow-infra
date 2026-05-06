@@ -1,0 +1,32 @@
+# Environment files — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Go build artifacts
+traffic-splitter/traffic-splitter
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Temporary shadow compose files
+/tmp/shadow-infra/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

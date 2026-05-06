@@ -1,0 +1,83 @@
+version: "3.9"
+
+# Shadow-Infra — local development stack
+# Copy .env.example to .env and fill in values before running.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Go tee proxy — mirrors 1% of traffic to the shadow pod
+  # ---------------------------------------------------------------------------
+  traffic-splitter:
+    build:
+      context: ./traffic-splitter
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      PROD_URL: ${PROD_URL}
+      SHADOW_URL: ${SHADOW_URL:-http://localhost:9000}
+      SHADOW_SAMPLE_RATE: ${SHADOW_SAMPLE_RATE:-0.01}
+      COMPARISON_API_URL: http://comparison-agent:8001
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      DEPLOYMENT_ID: ${DEPLOYMENT_ID:-}
+    depends_on:
+      comparison-agent:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Python FastAPI — GitHub webhook receiver + shadow lifecycle manager
+  # ---------------------------------------------------------------------------
+  pr-watcher:
+    build:
+      context: ./pr-watcher
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      SHADOW_COMPOSE_DIR: /tmp/shadow-infra
+    volumes:
+      # Mount Docker socket so pr-watcher can spawn sibling containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/shadow-infra:/tmp/shadow-infra
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Python FastAPI — LLM comparison agent
+  # ---------------------------------------------------------------------------
+  comparison-agent:
+    build:
+      context: ./comparison-agent
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # React + Vite frontend (dev server)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_SUPABASE_URL: ${SUPABASE_URL}
+      VITE_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+    restart: unless-stopped
