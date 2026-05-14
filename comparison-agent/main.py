@@ -6,9 +6,6 @@ FastAPI service that receives response pairs and returns LLM-classified verdicts
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
-
-import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
@@ -37,6 +34,7 @@ class HttpResponse(BaseModel):
     status: int
     headers: dict[str, str] = {}
     body: str = ""
+    latency_ms: int | None = None
 
 
 class CompareRequest(BaseModel):
@@ -100,23 +98,23 @@ async def compare(req: CompareRequest) -> CompareResult:
                 detail=f"Database error creating response pair: {exc}",
             ) from exc
 
-    # Call the LLM agent.
+    # Call the LangGraph analysis pipeline.
     try:
         verdict_data = compare_responses(
             prod_response=req.prod_response.model_dump(),
             shadow_response=req.shadow_response.model_dump(),
         )
-    except anthropic.APIError as exc:
-        logger.error("Anthropic API error: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM API error: {exc}",
-        ) from exc
     except ValueError as exc:
         logger.error("Agent returned invalid response: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Agent response error: {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.error("LLM pipeline error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"LLM pipeline error: {exc}",
         ) from exc
 
     # Persist the verdict.

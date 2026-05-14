@@ -30,9 +30,15 @@ CREATE TABLE response_pairs (
     prod_body       text NOT NULL DEFAULT '',
     shadow_status   int NOT NULL,
     shadow_headers  jsonb NOT NULL DEFAULT '{}',
-    shadow_body     text NOT NULL DEFAULT '',
-    captured_at     timestamptz NOT NULL DEFAULT now()
+    shadow_body       text NOT NULL DEFAULT '',
+    prod_latency_ms   integer,
+    shadow_latency_ms integer,
+    captured_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- Migration for existing databases:
+-- ALTER TABLE response_pairs ADD COLUMN IF NOT EXISTS prod_latency_ms integer;
+-- ALTER TABLE response_pairs ADD COLUMN IF NOT EXISTS shadow_latency_ms integer;
 
 CREATE INDEX idx_response_pairs_deployment_id ON response_pairs(deployment_id);
 CREATE INDEX idx_response_pairs_captured_at ON response_pairs(captured_at DESC);

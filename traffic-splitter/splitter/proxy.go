@@ -18,9 +18,10 @@ import (
 
 // capturedResponse holds a recorded HTTP response for comparison.
 type capturedResponse struct {
-	Status  int               `json:"status"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
+	Status    int               `json:"status"`
+	Headers   map[string]string `json:"headers"`
+	Body      string            `json:"body"`
+	LatencyMs int64             `json:"latency_ms"`
 }
 
 // comparePayload is the JSON body sent to the comparison-agent.
@@ -90,9 +91,11 @@ func (tp *TeeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Restore body for the prod proxy.
 	r.Body = io.NopCloser(bytes.NewBuffer(reqBodyBytes))
 
-	// Capture the prod response via a ResponseRecorder.
+	// Capture the prod response via a ResponseRecorder, recording latency.
 	rec := httptest.NewRecorder()
+	prodStart := time.Now()
 	tp.prodProxy.ServeHTTP(rec, r)
+	prodLatencyMs := time.Since(prodStart).Milliseconds()
 
 	// Copy the recorded prod response to the actual ResponseWriter.
 	prodResult := rec.Result()
@@ -122,7 +125,9 @@ func (tp *TeeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	deploymentID := tp.cfg.DeploymentID
 
 	go func() {
+		shadowStart := time.Now()
 		shadowResp, err := tp.fireShadowRequest(method, path, r.Header, reqBodyCopy)
+		shadowLatencyMs := time.Since(shadowStart).Milliseconds()
 		if err != nil {
 			log.Printf("[shadow] request failed: %v", err)
 			return
@@ -133,29 +138,33 @@ func (tp *TeeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		shadowHeaders := flattenHeaders(shadowResp.Header)
 
 		prodCaptured := capturedResponse{
-			Status:  prodStatus,
-			Headers: prodHeaders,
-			Body:    prodBody,
+			Status:    prodStatus,
+			Headers:   prodHeaders,
+			Body:      prodBody,
+			LatencyMs: prodLatencyMs,
 		}
 		shadowCaptured := capturedResponse{
-			Status:  shadowResp.StatusCode,
-			Headers: shadowHeaders,
-			Body:    string(shadowBodyBytes),
+			Status:    shadowResp.StatusCode,
+			Headers:   shadowHeaders,
+			Body:      string(shadowBodyBytes),
+			LatencyMs: shadowLatencyMs,
 		}
 
 		// Persist the response pair to Supabase (if configured) and get a pair ID.
 		pairID := ""
 		if tp.supaClient != nil && deploymentID != "" {
 			pairID, err = tp.supaClient.StoreResponsePair(store.ResponsePair{
-				DeploymentID:  deploymentID,
-				RequestPath:   path,
-				RequestMethod: method,
-				ProdStatus:    prodCaptured.Status,
-				ProdHeaders:   prodCaptured.Headers,
-				ProdBody:      prodCaptured.Body,
-				ShadowStatus:  shadowCaptured.Status,
-				ShadowHeaders: shadowCaptured.Headers,
-				ShadowBody:    shadowCaptured.Body,
+				DeploymentID:    deploymentID,
+				RequestPath:     path,
+				RequestMethod:   method,
+				ProdStatus:      prodCaptured.Status,
+				ProdHeaders:     prodCaptured.Headers,
+				ProdBody:        prodCaptured.Body,
+				ProdLatencyMs:   prodCaptured.LatencyMs,
+				ShadowStatus:    shadowCaptured.Status,
+				ShadowHeaders:   shadowCaptured.Headers,
+				ShadowBody:      shadowCaptured.Body,
+				ShadowLatencyMs: shadowCaptured.LatencyMs,
 			})
 			if err != nil {
 				log.Printf("[shadow] failed to store response pair: %v", err)

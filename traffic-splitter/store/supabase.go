@@ -27,15 +27,17 @@ func NewSupabaseClient(baseURL, anonKey string) *SupabaseClient {
 
 // ResponsePair is the data model for a captured prod/shadow response pair.
 type ResponsePair struct {
-	DeploymentID  string            `json:"deployment_id"`
-	RequestPath   string            `json:"request_path"`
-	RequestMethod string            `json:"request_method"`
-	ProdStatus    int               `json:"prod_status"`
-	ProdHeaders   map[string]string `json:"prod_headers"`
-	ProdBody      string            `json:"prod_body"`
-	ShadowStatus  int               `json:"shadow_status"`
-	ShadowHeaders map[string]string `json:"shadow_headers"`
-	ShadowBody    string            `json:"shadow_body"`
+	DeploymentID    string            `json:"deployment_id"`
+	RequestPath     string            `json:"request_path"`
+	RequestMethod   string            `json:"request_method"`
+	ProdStatus      int               `json:"prod_status"`
+	ProdHeaders     map[string]string `json:"prod_headers"`
+	ProdBody        string            `json:"prod_body"`
+	ProdLatencyMs   int64             `json:"prod_latency_ms"`
+	ShadowStatus    int               `json:"shadow_status"`
+	ShadowHeaders   map[string]string `json:"shadow_headers"`
+	ShadowBody      string            `json:"shadow_body"`
+	ShadowLatencyMs int64             `json:"shadow_latency_ms"`
 }
 
 // insertResponse is used to parse the row ID returned by Supabase on insert.
