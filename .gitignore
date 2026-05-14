@@ -30,3 +30,6 @@ frontend/.vite/
 *.swo
 .idea/
 .vscode/
+
+AGENTS.md
+CLAUDE.md

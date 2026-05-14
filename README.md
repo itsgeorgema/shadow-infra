@@ -1,6 +1,6 @@
 # Shadow-Infra
 
-Shadow-Infra mirrors real traffic to temporary "shadow" pods when a GitHub PR is opened, compares responses with Claude, and shows a **Drift Report** UI so you can spot regressions before merging.
+Shadow-Infra mirrors real traffic to temporary "shadow" pods when a GitHub PR is opened, compares responses with a multi-step LangGraph pipeline, and shows a **Drift Report** UI so you can spot regressions before merging.
 
 ## Architecture
 
@@ -13,13 +13,16 @@ GitHub PR opened
 
 Incoming HTTP traffic
     → traffic-splitter (Go tee proxy :8080)
-    → 100% → Production upstream (blocking, returned to client)
-    → 1%  → Shadow pod (non-blocking goroutine)
-    → Both responses stored in Supabase via comparison-agent
+    → 100% → Production upstream (blocking, returned to client, latency recorded)
+    → 1%   → Shadow pod (non-blocking goroutine, latency recorded)
+    → Both responses + latencies stored in Supabase via comparison-agent
 
 comparison-agent (FastAPI :8001)
-    → POST /compare receives (prod, shadow) response pair
-    → Calls Claude claude-sonnet-4-6 to classify: Safe / Warning / Critical
+    → POST /compare receives (prod, shadow) response pair + latencies
+    → Runs LangGraph analysis pipeline:
+         structural_check  (rule-based, no LLM)
+              ├─ obvious Critical/Warning → format_verdict  (fast path, no LLM call)
+              └─ ambiguous               → extract_diffs → semantic_analysis → format_verdict
     → Stores verdict + diff in Supabase
 
 frontend (React + Vite :5173)
@@ -31,10 +34,46 @@ frontend (React + Vite :5173)
 
 | Service | Language | Port | Description |
 |---|---|---|---|
-| `traffic-splitter` | Go 1.21 | 8080 | Tee proxy — 1% mirror to shadow |
+| `traffic-splitter` | Go 1.21 | 8080 | Tee proxy — 1% mirror to shadow, records latency |
 | `pr-watcher` | Python / FastAPI | 8000 | GitHub webhook handler |
-| `comparison-agent` | Python / FastAPI | 8001 | LLM comparison via Claude API |
+| `comparison-agent` | Python / FastAPI | 8001 | LangGraph analysis pipeline (Claude claude-sonnet-4-6) |
 | `frontend` | React + Vite | 5173 | Drift Report UI |
+
+## Comparison Agent — LangGraph Pipeline
+
+The comparison agent uses a **multi-step LangGraph graph** instead of a single-shot LLM call. This avoids wasting tokens on obvious cases and gives the LLM structured data to reason over.
+
+```
+START → structural_check → (fast path) → format_verdict → END
+                         → (ambiguous) → extract_diffs → semantic_analysis → format_verdict → END
+```
+
+### Nodes
+
+**`structural_check`** — pure Python, no LLM:
+- Shadow 5xx when prod is 2xx → **Critical** immediately
+- Auth failure (401/403) on shadow when prod succeeded → **Critical** immediately
+- Shadow latency ≥ 10× prod → **Critical**; ≥ 3× prod → **Warning**
+- Empty shadow body when prod has content → **Critical**
+- Any match triggers the fast path, skipping the LLM entirely
+
+**`extract_diffs`** — pure Python:
+- Parses both response bodies as JSON and computes added/removed/changed keys
+- Detects type changes on shared keys (e.g. `string` → `number`)
+- Falls back to size diff and content-type change detection for non-JSON bodies
+
+**`semantic_analysis`** — LLM (Claude claude-sonnet-4-6):
+- Receives structural flags + structured field diffs + truncated raw bodies
+- Uses `with_structured_output(VerdictModel)` (Pydantic) — no manual JSON parsing
+- System prompt is cached via `cache_control: ephemeral`
+
+**`format_verdict`** — pure Python:
+- If fast path was taken: assembles verdict from rule-based flags
+- If LLM path was taken: no-op (verdict already in state from `semantic_analysis`)
+
+### Latency Tracking
+
+`response_pairs` stores `prod_latency_ms` and `shadow_latency_ms` for every captured pair. The traffic-splitter records wall-clock time around both the production proxy call and the shadow request, and sends both values to the comparison agent in the `/compare` payload.
 
 ## Quick Start
 
@@ -74,6 +113,13 @@ The following steps cannot be automated and must be completed by you:
 2. Open the **SQL Editor** in your project dashboard.
 3. Paste and run the contents of `supabase/schema.sql`.
 4. Copy your **Project URL**, **anon key**, and **service_role key** into `.env`.
+
+If you have an existing database from a prior version of this project, run the migration at the bottom of `supabase/schema.sql` to add the latency columns:
+
+```sql
+ALTER TABLE response_pairs ADD COLUMN IF NOT EXISTS prod_latency_ms integer;
+ALTER TABLE response_pairs ADD COLUMN IF NOT EXISTS shadow_latency_ms integer;
+```
 
 ### 2. Configure a GitHub webhook
 
@@ -192,16 +238,16 @@ shadow-infra/
 ├── supabase/schema.sql          — DB tables: shadow_deployments, response_pairs, verdicts
 ├── traffic-splitter/            — Go tee proxy
 │   ├── main.go
-│   ├── splitter/proxy.go        — httputil.ReverseProxy + shadow goroutine
+│   ├── splitter/proxy.go        — httputil.ReverseProxy + shadow goroutine + latency timing
 │   ├── splitter/config.go       — env-based configuration
 │   └── store/supabase.go        — HTTP client for Supabase REST API
 ├── pr-watcher/                  — GitHub webhook handler
 │   ├── main.py                  — FastAPI app, webhook verification, lifecycle
 │   ├── manifest_parser.py       — Fetch + parse docker-compose.yaml from GitHub
 │   └── shadow_manager.py        — docker-compose up/down for shadow pods
-├── comparison-agent/            — LLM verdict service
+├── comparison-agent/            — LangGraph analysis pipeline
 │   ├── main.py                  — POST /compare endpoint
-│   └── agent.py                 — Claude API call with prompt caching
+│   └── agent.py                 — LangGraph graph: structural_check → extract_diffs → semantic_analysis
 └── frontend/                    — React + Vite + Tailwind
     └── src/
         ├── api.ts               — Supabase JS client + query functions
