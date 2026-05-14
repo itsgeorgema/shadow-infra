@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comparison-agent
+  namespace: shadow-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comparison-agent
+  template:
+    metadata:
+      labels:
+        app: comparison-agent
+    spec:
+      containers:
+        - name: comparison-agent
+          image: <your-registry>/comparison-agent:latest
+          ports:
+            - containerPort: 8001
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_URL
+            - name: SUPABASE_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_SERVICE_KEY
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comparison-agent
+  namespace: shadow-infra
+spec:
+  selector:
+    app: comparison-agent
+  ports:
+    - port: 8001
+      targetPort: 8001
+  type: ClusterIP

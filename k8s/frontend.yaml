@@ -1,0 +1,60 @@
+# NOTE: The frontend Dockerfile runs `npm run dev` (Vite dev server).
+# VITE_* env vars are read at server startup, so K8s env injection works here.
+# For a production deployment, rebuild the image with `npm run build` and serve
+# the dist/ folder with nginx instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: shadow-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: <your-registry>/frontend:latest
+          ports:
+            - containerPort: 5173
+          env:
+            - name: VITE_SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_URL
+            - name: VITE_SUPABASE_ANON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_ANON_KEY
+          livenessProbe:
+            tcpSocket:
+              port: 5173
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: shadow-infra
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 5173
+  type: LoadBalancer

@@ -179,13 +179,19 @@ ngrok http 8000
 
 ### 6. Deploy to production
 
-Suggested platforms (all support Docker):
+#### Option A — Kubernetes (recommended)
+
+See the [Kubernetes deployment](#kubernetes-deployment) section below.
+
+#### Option B — Docker (single host)
+
+Suggested platforms:
 
 - **[Railway](https://railway.app)** — simplest, import repo and deploy each service
 - **[Render](https://render.com)** — Docker support, free tier available
 - **[Fly.io](https://fly.io)** — `fly launch` in each service directory
 
-For the traffic-splitter, you will need to configure your DNS / load balancer to route production traffic through it on port 8080.
+For the traffic-splitter, configure your DNS / load balancer to route production traffic through it on port 8080.
 
 ---
 
@@ -218,10 +224,10 @@ npm run dev
 | Variable | Used by | Description |
 |---|---|---|
 | `PROD_URL` | traffic-splitter | URL of the production upstream |
-| `SHADOW_URL` | traffic-splitter | URL of the active shadow pod |
+| `SHADOW_URL` | traffic-splitter | URL of the active shadow pod (patched automatically by pr-watcher in K8s) |
 | `SHADOW_SAMPLE_RATE` | traffic-splitter | Fraction of requests to mirror (0–1) |
 | `COMPARISON_API_URL` | traffic-splitter | URL of comparison-agent |
-| `DEPLOYMENT_ID` | traffic-splitter | Supabase deployment ID for this PR |
+| `DEPLOYMENT_ID` | traffic-splitter | Supabase deployment ID for this PR (patched automatically by pr-watcher in K8s) |
 | `SUPABASE_URL` | all services | Supabase project REST URL |
 | `SUPABASE_ANON_KEY` | traffic-splitter, frontend | Public anon key |
 | `SUPABASE_SERVICE_KEY` | pr-watcher, comparison-agent | Service-role key (full access) |
@@ -230,6 +236,108 @@ npm run dev
 | `ANTHROPIC_API_KEY` | comparison-agent | Anthropic API key for Claude |
 | `VITE_SUPABASE_URL` | frontend | Supabase URL (Vite public env var) |
 | `VITE_SUPABASE_ANON_KEY` | frontend | Supabase anon key (Vite public env var) |
+| `SHADOW_NAMESPACE` | pr-watcher | K8s namespace for shadow Deployments (default: `shadow-infra`) |
+| `TRAFFIC_SPLITTER_DEPLOYMENT` | pr-watcher | K8s Deployment name to patch on PR open/close (default: `traffic-splitter`) |
+
+---
+
+## Kubernetes Deployment
+
+All manifests are in `k8s/`. The setup is self-contained within the `shadow-infra` namespace.
+
+### How it works in K8s
+
+When a PR is opened, pr-watcher:
+1. Creates a K8s `Deployment` + `ClusterIP Service` named `shadow-pr{N}` in the `shadow-infra` namespace
+2. Patches the `traffic-splitter` Deployment's `SHADOW_URL` and `DEPLOYMENT_ID` env vars, triggering a rolling restart
+3. Traffic-splitter begins mirroring 1% of requests to `http://shadow-pr{N}:{port}`
+
+When the PR is closed, pr-watcher deletes the shadow Deployment/Service and clears the traffic-splitter's env vars (re-entering passthrough mode).
+
+### Prerequisites
+
+- Kubernetes cluster (EKS, GKE, AKS, or local minikube/kind)
+- `kubectl` and `kustomize` (or `kubectl` ≥ 1.14 which bundles kustomize)
+- A container registry to push images to (e.g. GHCR, ECR, Docker Hub)
+
+### 1. Build and push images
+
+```bash
+REGISTRY=ghcr.io/your-org   # replace with your registry
+
+docker build -t $REGISTRY/traffic-splitter:latest ./traffic-splitter
+docker build -t $REGISTRY/pr-watcher:latest        ./pr-watcher
+docker build -t $REGISTRY/comparison-agent:latest  ./comparison-agent
+docker build -t $REGISTRY/frontend:latest          ./frontend
+
+docker push $REGISTRY/traffic-splitter:latest
+docker push $REGISTRY/pr-watcher:latest
+docker push $REGISTRY/comparison-agent:latest
+docker push $REGISTRY/frontend:latest
+```
+
+### 2. Set image names in manifests
+
+Replace `<your-registry>/...` in each manifest with your actual image paths:
+
+```bash
+sed -i "s|<your-registry>|$REGISTRY|g" k8s/*.yaml
+```
+
+### 3. Create the secret
+
+Fill in `k8s/secret.yaml` (all values are base64-encoded):
+
+```bash
+echo -n "https://your-project.supabase.co" | base64   # SUPABASE_URL
+echo -n "your-anon-key"                    | base64   # SUPABASE_ANON_KEY
+# ... etc.
+```
+
+Then apply it:
+
+```bash
+kubectl apply -f k8s/secret.yaml
+```
+
+### 4. Apply everything else
+
+```bash
+kubectl apply -k k8s/
+```
+
+This applies (in order): namespace → comparison-agent → traffic-splitter → pr-watcher (with ServiceAccount + RBAC) → frontend.
+
+### 5. Verify
+
+```bash
+kubectl get pods -n shadow-infra
+kubectl get svc  -n shadow-infra
+```
+
+All four pods should reach `Running` state. The `comparison-agent` readiness probe must pass before traffic-splitter starts.
+
+### 6. Point GitHub webhooks at pr-watcher
+
+```bash
+kubectl get svc pr-watcher -n shadow-infra
+# Copy the EXTERNAL-IP and set it as the GitHub webhook URL: http://<EXTERNAL-IP>/webhook
+```
+
+### 7. Route production traffic through traffic-splitter
+
+```bash
+kubectl get svc traffic-splitter -n shadow-infra
+# Configure your load balancer / Ingress to forward traffic to <EXTERNAL-IP>:8080
+```
+
+### RBAC summary
+
+pr-watcher runs under a dedicated `ServiceAccount` with a namespace-scoped `Role` granting:
+- `apps/deployments`: get, create, update, patch, replace, delete
+- `core/services`: get, create, delete
+
+This is the minimum required to manage shadow Deployments and patch the traffic-splitter.
 
 ## Project Structure
 
@@ -244,7 +352,7 @@ shadow-infra/
 ├── pr-watcher/                  — GitHub webhook handler
 │   ├── main.py                  — FastAPI app, webhook verification, lifecycle
 │   ├── manifest_parser.py       — Fetch + parse docker-compose.yaml from GitHub
-│   └── shadow_manager.py        — docker-compose up/down for shadow pods
+│   └── shadow_manager.py        — K8s Deployment/Service create/delete + traffic-splitter patch
 ├── comparison-agent/            — LangGraph analysis pipeline
 │   ├── main.py                  — POST /compare endpoint
 │   └── agent.py                 — LangGraph graph: structural_check → extract_diffs → semantic_analysis

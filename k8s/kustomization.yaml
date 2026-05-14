@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Apply secret.yaml separately after filling in base64 values — it is excluded
+# here intentionally so `kubectl apply -k k8s/` never overwrites a live secret.
+resources:
+  - namespace.yaml
+  - comparison-agent.yaml
+  - traffic-splitter.yaml
+  - pr-watcher.yaml
+  - frontend.yaml

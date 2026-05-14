@@ -1,147 +1,184 @@
 """
 shadow_manager.py
-Creates and destroys per-PR shadow containers using ephemeral docker-compose files.
+Creates and destroys per-PR shadow Deployments and Services using the Kubernetes API.
+Replaces the previous docker-compose/Docker-socket approach so pr-watcher runs on
+any K8s node regardless of container runtime.
 """
 
 import logging
 import os
-import subprocess
-import tempfile
-from pathlib import Path
 
-import yaml
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
 
-# Base host port for shadow services. Each PR gets port BASE_PORT + pr_number.
-BASE_PORT = 9000
-
-# Directory where temporary compose files are stored.
-COMPOSE_DIR = Path(os.getenv("SHADOW_COMPOSE_DIR", "/tmp/shadow-infra"))
+NAMESPACE = os.getenv("SHADOW_NAMESPACE", "shadow-infra")
+TRAFFIC_SPLITTER_DEPLOYMENT = os.getenv("TRAFFIC_SPLITTER_DEPLOYMENT", "traffic-splitter")
 
 
-def _compose_file_path(pr_number: int) -> Path:
-    COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
-    return COMPOSE_DIR / f"shadow-{pr_number}.yaml"
+def _k8s_clients() -> tuple[client.AppsV1Api, client.CoreV1Api]:
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        # Fallback for local development with a kubeconfig.
+        config.load_kube_config()
+    return client.AppsV1Api(), client.CoreV1Api()
 
 
-def _project_name(pr_number: int) -> str:
+def _deployment_name(pr_number: int) -> str:
     return f"shadow-pr{pr_number}"
 
 
-def _host_port(pr_number: int) -> int:
-    return BASE_PORT + pr_number
-
-
-def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """Run a subprocess command, logging output and raising on failure."""
-    logger.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.stdout:
-        logger.debug("stdout: %s", result.stdout.strip())
-    if result.stderr:
-        logger.debug("stderr: %s", result.stderr.strip())
-    if check and result.returncode != 0:
-        raise RuntimeError(
-            f"Command {' '.join(cmd)} failed (exit {result.returncode}):\n"
-            f"{result.stderr}"
-        )
-    return result
-
-
-def spin_up_shadow(
-    pr_number: int,
-    image: str,
-    container_port: str,
-) -> str:
+def spin_up_shadow(pr_number: int, image: str, container_port: str) -> str:
     """
-    Write a temporary docker-compose file and start the shadow container.
+    Create (or replace) a Deployment and ClusterIP Service for the shadow pod.
 
     Args:
-        pr_number:      GitHub PR number (used for unique naming and port allocation).
-        image:          Docker image to run (e.g. "my-app:pr-42").
-        container_port: The port the container listens on internally.
+        pr_number:      GitHub PR number — used as the unique resource name suffix.
+        image:          Docker image to run (e.g. "ghcr.io/org/app:pr-42").
+        container_port: Port the container listens on.
 
     Returns:
-        The shadow service URL (e.g. "http://localhost:9042").
+        In-cluster shadow URL (e.g. "http://shadow-pr42:8080").
 
     Raises:
-        RuntimeError: If docker-compose fails to start the container.
+        ApiException: On unexpected Kubernetes API errors.
     """
-    host_port = _host_port(pr_number)
-    service_name = f"shadow-pr{pr_number}"
-    compose_path = _compose_file_path(pr_number)
+    apps_api, core_api = _k8s_clients()
+    name = _deployment_name(pr_number)
+    port = int(container_port)
+    labels = {"app": name, "shadow-infra": "true", "pr": str(pr_number)}
 
-    compose_content = {
-        "version": "3.8",
-        "services": {
-            service_name: {
-                "image": image,
-                "ports": [f"{host_port}:{container_port}"],
-                "restart": "no",
-                "labels": [
-                    "shadow-infra=true",
-                    f"shadow-infra.pr={pr_number}",
-                ],
-                "environment": {
-                    "SHADOW_MODE": "true",
-                    "PR_NUMBER": str(pr_number),
-                },
-            }
-        },
-    }
+    deployment = client.V1Deployment(
+        metadata=client.V1ObjectMeta(name=name, namespace=NAMESPACE, labels=labels),
+        spec=client.V1DeploymentSpec(
+            replicas=1,
+            selector=client.V1LabelSelector(match_labels={"app": name}),
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(labels={"app": name}),
+                spec=client.V1PodSpec(
+                    containers=[
+                        client.V1Container(
+                            name=name,
+                            image=image,
+                            ports=[client.V1ContainerPort(container_port=port)],
+                            env=[
+                                client.V1EnvVar(name="SHADOW_MODE", value="true"),
+                                client.V1EnvVar(name="PR_NUMBER", value=str(pr_number)),
+                            ],
+                        )
+                    ]
+                ),
+            ),
+        ),
+    )
 
-    compose_yaml = yaml.dump(compose_content, default_flow_style=False)
-    compose_path.write_text(compose_yaml)
-    logger.info("Wrote compose file to %s", compose_path)
+    service = client.V1Service(
+        metadata=client.V1ObjectMeta(name=name, namespace=NAMESPACE, labels=labels),
+        spec=client.V1ServiceSpec(
+            selector={"app": name},
+            ports=[client.V1ServicePort(port=port, target_port=port)],
+            type="ClusterIP",
+        ),
+    )
 
-    _run([
-        "docker-compose",
-        "-f", str(compose_path),
-        "-p", _project_name(pr_number),
-        "up", "-d", "--pull", "always",
-    ])
+    # Upsert Deployment — replace if it already exists (e.g. synchronize event).
+    try:
+        apps_api.read_namespaced_deployment(name=name, namespace=NAMESPACE)
+        apps_api.replace_namespaced_deployment(name=name, namespace=NAMESPACE, body=deployment)
+        logger.info("Replaced Deployment %s in namespace %s", name, NAMESPACE)
+    except ApiException as exc:
+        if exc.status == 404:
+            apps_api.create_namespaced_deployment(namespace=NAMESPACE, body=deployment)
+            logger.info("Created Deployment %s in namespace %s", name, NAMESPACE)
+        else:
+            raise
 
-    shadow_url = f"http://localhost:{host_port}"
-    logger.info("Shadow for PR #%d started at %s", pr_number, shadow_url)
+    # Upsert Service — create only; selector is stable across synchronize events.
+    try:
+        core_api.read_namespaced_service(name=name, namespace=NAMESPACE)
+        logger.info("Service %s already exists — reusing", name)
+    except ApiException as exc:
+        if exc.status == 404:
+            core_api.create_namespaced_service(namespace=NAMESPACE, body=service)
+            logger.info("Created Service %s in namespace %s", name, NAMESPACE)
+        else:
+            raise
+
+    shadow_url = f"http://{name}:{port}"
+    logger.info("Shadow for PR #%d live at %s", pr_number, shadow_url)
     return shadow_url
 
 
 def tear_down_shadow(pr_number: int) -> None:
     """
-    Stop and remove the shadow container for the given PR.
+    Delete the Deployment and Service for the given PR.
 
     Args:
         pr_number: GitHub PR number.
 
     Raises:
-        RuntimeError: If docker-compose fails to bring down the container.
+        RuntimeError: If deletion fails for a reason other than 404.
     """
-    compose_path = _compose_file_path(pr_number)
+    apps_api, core_api = _k8s_clients()
+    name = _deployment_name(pr_number)
 
-    if not compose_path.exists():
-        logger.warning(
-            "No compose file found for PR #%d at %s — already cleaned up?",
-            pr_number,
-            compose_path,
-        )
-        return
-
-    _run([
-        "docker-compose",
-        "-f", str(compose_path),
-        "-p", _project_name(pr_number),
-        "down", "--remove-orphans",
-    ])
-
-    try:
-        compose_path.unlink()
-    except OSError as exc:
-        logger.warning("Could not remove compose file %s: %s", compose_path, exc)
+    for label, delete_fn in [
+        ("Deployment", lambda: apps_api.delete_namespaced_deployment(
+            name=name, namespace=NAMESPACE,
+            body=client.V1DeleteOptions(propagation_policy="Foreground"),
+        )),
+        ("Service", lambda: core_api.delete_namespaced_service(
+            name=name, namespace=NAMESPACE,
+        )),
+    ]:
+        try:
+            delete_fn()
+            logger.info("Deleted %s %s", label, name)
+        except ApiException as exc:
+            if exc.status == 404:
+                logger.warning("%s %s not found — already deleted?", label, name)
+            else:
+                raise RuntimeError(f"Failed to delete {label} {name}: {exc}") from exc
 
     logger.info("Shadow for PR #%d torn down", pr_number)
+
+
+def patch_traffic_splitter(shadow_url: str, deployment_id: str) -> None:
+    """
+    Patch the traffic-splitter Deployment env vars so it routes shadow traffic
+    to the newly created (or cleared) shadow target.
+
+    Setting shadow_url="" disables shadowing until the next PR is activated.
+    """
+    apps_api, _ = _k8s_clients()
+    patch = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": "traffic-splitter",
+                        "env": [
+                            {"name": "SHADOW_URL", "value": shadow_url},
+                            {"name": "DEPLOYMENT_ID", "value": deployment_id},
+                        ],
+                    }]
+                }
+            }
+        }
+    }
+    apps_api.patch_namespaced_deployment(
+        name=TRAFFIC_SPLITTER_DEPLOYMENT,
+        namespace=NAMESPACE,
+        body=patch,
+    )
+    logger.info(
+        "Patched %s: SHADOW_URL=%r DEPLOYMENT_ID=%r",
+        TRAFFIC_SPLITTER_DEPLOYMENT, shadow_url, deployment_id,
+    )
+
+
+def clear_traffic_splitter() -> None:
+    """Remove the active shadow target from the traffic-splitter (PR closed)."""
+    patch_traffic_splitter(shadow_url="", deployment_id="")

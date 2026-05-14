@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-splitter
+  namespace: shadow-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-splitter
+  template:
+    metadata:
+      labels:
+        app: traffic-splitter
+    spec:
+      containers:
+        - name: traffic-splitter
+          image: <your-registry>/traffic-splitter:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PROD_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: PROD_URL
+            - name: SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_URL
+            - name: SUPABASE_ANON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_ANON_KEY
+            # Resolved via K8s DNS within the shadow-infra namespace.
+            - name: COMPARISON_API_URL
+              value: "http://comparison-agent:8001"
+            # SHADOW_URL and DEPLOYMENT_ID start empty; pr-watcher patches them
+            # via the K8s API when a PR opens, triggering a rolling restart.
+            # Shadowing is automatically disabled when these are empty.
+            - name: SHADOW_URL
+              value: ""
+            - name: DEPLOYMENT_ID
+              value: ""
+            - name: SHADOW_SAMPLE_RATE
+              value: "0.01"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-splitter
+  namespace: shadow-infra
+spec:
+  selector:
+    app: traffic-splitter
+  ports:
+    - port: 8080
+      targetPort: 8080
+  # Use LoadBalancer if your cluster supports it; otherwise NodePort or an Ingress.
+  type: LoadBalancer

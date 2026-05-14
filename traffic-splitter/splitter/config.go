@@ -33,9 +33,8 @@ func LoadConfig() (*Config, error) {
 	if cfg.ProdURL == "" {
 		return nil, fmt.Errorf("PROD_URL is required")
 	}
-	if cfg.ShadowURL == "" {
-		return nil, fmt.Errorf("SHADOW_URL is required")
-	}
+	// SHADOW_URL is optional — if empty, shadowing is disabled until pr-watcher
+	// patches the Deployment with an active shadow target.
 	if cfg.ComparisonAPIURL == "" {
 		return nil, fmt.Errorf("COMPARISON_API_URL is required")
 	}

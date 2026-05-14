@@ -110,7 +110,8 @@ func (tp *TeeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write(prodBodyBytes) //nolint:errcheck
 
 	// Decide whether to shadow this request.
-	if tp.rng.Float64() >= tp.cfg.ShadowSampleRate {
+	// Skip if no shadow target is configured (pr-watcher hasn't patched one in yet).
+	if tp.cfg.ShadowURL == "" || tp.rng.Float64() >= tp.cfg.ShadowSampleRate {
 		return
 	}
 

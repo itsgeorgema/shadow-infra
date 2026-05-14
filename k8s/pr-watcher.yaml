@@ -1,0 +1,113 @@
+# ServiceAccount used by pr-watcher to call the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pr-watcher
+  namespace: shadow-infra
+---
+# Grants pr-watcher permission to manage shadow Deployments and Services
+# within the shadow-infra namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pr-watcher
+  namespace: shadow-infra
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "update", "patch", "replace", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pr-watcher
+  namespace: shadow-infra
+subjects:
+  - kind: ServiceAccount
+    name: pr-watcher
+    namespace: shadow-infra
+roleRef:
+  kind: Role
+  name: pr-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pr-watcher
+  namespace: shadow-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pr-watcher
+  template:
+    metadata:
+      labels:
+        app: pr-watcher
+    spec:
+      serviceAccountName: pr-watcher
+      containers:
+        - name: pr-watcher
+          image: <your-registry>/pr-watcher:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: GITHUB_WEBHOOK_SECRET
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: GITHUB_TOKEN
+            - name: SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_URL
+            - name: SUPABASE_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shadow-infra-secrets
+                  key: SUPABASE_SERVICE_KEY
+            - name: SHADOW_NAMESPACE
+              value: "shadow-infra"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pr-watcher
+  namespace: shadow-infra
+spec:
+  selector:
+    app: pr-watcher
+  ports:
+    - port: 80
+      targetPort: 8000
+  # Needs to be reachable by GitHub webhook delivery.
+  type: LoadBalancer

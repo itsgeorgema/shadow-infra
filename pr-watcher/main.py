@@ -16,7 +16,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from supabase import Client, create_client
 
 from manifest_parser import parse_manifest
-from shadow_manager import spin_up_shadow, tear_down_shadow
+from shadow_manager import (
+    clear_traffic_splitter,
+    patch_traffic_splitter,
+    spin_up_shadow,
+    tear_down_shadow,
+)
 
 load_dotenv()
 
@@ -188,6 +193,11 @@ async def _handle_pr_open(
         deployment_status="active",
     )
 
+    try:
+        patch_traffic_splitter(shadow_url=shadow_url, deployment_id=dep_id)
+    except Exception as exc:
+        logger.warning("Could not patch traffic-splitter (non-fatal): %s", exc)
+
     logger.info("Shadow deployment %s created for PR #%d at %s", dep_id, pr_number, shadow_url)
     return {
         "status": "shadow_started",
@@ -203,6 +213,11 @@ async def _handle_pr_close(pr_number: int, repo: str) -> dict[str, Any]:
     except RuntimeError as exc:
         logger.error("Failed to tear down shadow for PR #%d: %s", pr_number, exc)
         # Don't surface a 500 — the PR is closed regardless.
+
+    try:
+        clear_traffic_splitter()
+    except Exception as exc:
+        logger.warning("Could not clear traffic-splitter (non-fatal): %s", exc)
 
     _set_deployment_status(pr_number, repo, "closed")
     logger.info("Shadow for PR #%d torn down and marked closed", pr_number)
